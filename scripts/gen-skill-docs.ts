@@ -19,7 +19,7 @@ const DRY_RUN = process.argv.includes('--dry-run');
 
 // ─── Template Context ───────────────────────────────────────
 
-type Host = 'claude' | 'codex';
+type Host = 'claude' | 'codex' | 'pi';
 const OPENAI_SHORT_DESCRIPTION_LIMIT = 120;
 
 const HOST_ARG = process.argv.find(a => a.startsWith('--host'));
@@ -27,8 +27,9 @@ const HOST: Host = (() => {
   if (!HOST_ARG) return 'claude';
   const val = HOST_ARG.includes('=') ? HOST_ARG.split('=')[1] : process.argv[process.argv.indexOf(HOST_ARG) + 1];
   if (val === 'codex' || val === 'agents') return 'codex';
+  if (val === 'pi') return 'pi';
   if (val === 'claude') return 'claude';
-  throw new Error(`Unknown host: ${val}. Use claude, codex, or agents.`);
+  throw new Error(`Unknown host: ${val}. Use claude, codex, pi, or agents.`);
 })();
 
 interface HostPaths {
@@ -48,6 +49,12 @@ const HOST_PATHS: Record<Host, HostPaths> = {
   codex: {
     skillRoot: '$GSTACK_ROOT',
     localSkillRoot: '.agents/skills/gstack',
+    binDir: '$GSTACK_BIN',
+    browseDir: '$GSTACK_BROWSE',
+  },
+  pi: {
+    skillRoot: '$GSTACK_ROOT',
+    localSkillRoot: '.pi/skills/gstack',
     binDir: '$GSTACK_BIN',
     browseDir: '$GSTACK_BROWSE',
   },
@@ -181,6 +188,13 @@ function generatePreambleBash(ctx: TemplateContext): string {
     ? `_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
 GSTACK_ROOT="$HOME/.codex/skills/gstack"
 [ -n "$_ROOT" ] && [ -d "$_ROOT/.agents/skills/gstack" ] && GSTACK_ROOT="$_ROOT/.agents/skills/gstack"
+GSTACK_BIN="$GSTACK_ROOT/bin"
+GSTACK_BROWSE="$GSTACK_ROOT/browse/dist"
+`
+    : ctx.host === 'pi'
+    ? `_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+GSTACK_ROOT="$HOME/.pi/agent/skills/gstack"
+[ -n "$_ROOT" ] && [ -d "$_ROOT/.pi/skills/gstack" ] && GSTACK_ROOT="$_ROOT/.pi/skills/gstack"
 GSTACK_BIN="$GSTACK_ROOT/bin"
 GSTACK_BROWSE="$GSTACK_ROOT/browse/dist"
 `
@@ -2908,7 +2922,13 @@ function transformFrontmatter(content: string, host: Host): string {
   const fmEnd = content.indexOf('\n---', fmStart + 4);
   if (fmEnd === -1) return content;
   const body = content.slice(fmEnd + 4); // includes the leading \n after ---
-  const { name, description } = extractNameAndDescription(content);
+  const { name: rawName, description } = extractNameAndDescription(content);
+
+  // For pi host, prefix name with gstack- to match directory convention (codexSkillName)
+  // Pi validates that the name: field matches the parent directory name
+  const name = (host === 'pi' && rawName && rawName !== 'gstack' && !rawName.startsWith('gstack-'))
+    ? `gstack-${rawName}`
+    : rawName;
 
   // Codex 1024-char description limit — fail build, don't ship broken skills
   const MAX_DESC = 1024;
@@ -2969,10 +2989,15 @@ function processTemplate(tmplPath: string, host: Host = 'claude'): { outputPath:
   // Determine skill directory relative to ROOT
   const skillDir = path.relative(ROOT, path.dirname(tmplPath));
 
-  // For codex host, route output to .agents/skills/{codexSkillName}/SKILL.md
+  // For codex/pi hosts, route output to {host-dir}/skills/{skillName}/SKILL.md
   if (host === 'codex') {
     const codexName = codexSkillName(skillDir === '.' ? '' : skillDir);
     outputDir = path.join(ROOT, '.agents', 'skills', codexName);
+    fs.mkdirSync(outputDir, { recursive: true });
+    outputPath = path.join(outputDir, 'SKILL.md');
+  } else if (host === 'pi') {
+    const piName = codexSkillName(skillDir === '.' ? '' : skillDir);
+    outputDir = path.join(ROOT, '.pi', 'skills', piName);
     fs.mkdirSync(outputDir, { recursive: true });
     outputPath = path.join(outputDir, 'SKILL.md');
   }
@@ -3002,8 +3027,8 @@ function processTemplate(tmplPath: string, host: Host = 'claude'): { outputPath:
     throw new Error(`Unresolved placeholders in ${relTmplPath}: ${remaining.join(', ')}`);
   }
 
-  // For codex host: transform frontmatter and replace Claude-specific paths
-  if (host === 'codex') {
+  // For codex/pi hosts: transform frontmatter and replace Claude-specific paths
+  if (host === 'codex' || host === 'pi') {
     // Extract hook safety prose BEFORE transforming frontmatter (which strips hooks)
     const safetyProse = extractHookSafetyProse(tmplContent);
 
@@ -3019,10 +3044,16 @@ function processTemplate(tmplPath: string, host: Host = 'claude'): { outputPath:
     // Replace remaining hardcoded Claude paths with host-appropriate paths
     content = content.replace(/~\/\.claude\/skills\/gstack/g, ctx.paths.skillRoot);
     content = content.replace(/\.claude\/skills\/gstack/g, ctx.paths.localSkillRoot);
-    content = content.replace(/\.claude\/skills\/review/g, '.agents/skills/gstack/review');
-    content = content.replace(/\.claude\/skills/g, '.agents/skills');
+    if (host === 'codex') {
+      content = content.replace(/\.claude\/skills\/review/g, '.agents/skills/gstack/review');
+      content = content.replace(/\.claude\/skills/g, '.agents/skills');
+    } else {
+      content = content.replace(/\.claude\/skills\/review/g, '.pi/skills/gstack/review');
+      content = content.replace(/\.claude\/skills/g, '.pi/skills');
+    }
 
-    if (outputDir) {
+    // Write openai.yaml agent metadata (codex only — pi doesn't need it)
+    if (host === 'codex' && outputDir) {
       const codexName = codexSkillName(skillDir === '.' ? '' : skillDir);
       const agentsDir = path.join(outputDir, 'agents');
       fs.mkdirSync(agentsDir, { recursive: true });
@@ -3063,8 +3094,8 @@ function findTemplates(): string[] {
 let hasChanges = false;
 
 for (const tmplPath of findTemplates()) {
-  // Skip /codex skill for codex host (self-referential — it's a Claude wrapper around codex exec)
-  if (HOST === 'codex') {
+  // Skip /codex skill for codex/pi hosts (self-referential — it's a Claude wrapper around codex exec)
+  if (HOST === 'codex' || HOST === 'pi') {
     const dir = path.basename(path.dirname(tmplPath));
     if (dir === 'codex') continue;
   }
