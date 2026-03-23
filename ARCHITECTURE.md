@@ -239,7 +239,7 @@ Tier 1 runs on every `bun test`. Tiers 2+3 are gated behind `EVALS=1`. The idea 
 
 ### Multi-host generation (Claude, Codex, Pi)
 
-Skills are authored as Claude-native `.tmpl` templates and transformed for other hosts at generation time. The `--host` flag controls output:
+Claude-native `.tmpl` templates are transformed per host at generation time:
 
 ```
 bun run gen:skill-docs               # Claude (default) → {skill}/SKILL.md
@@ -247,69 +247,41 @@ bun run gen:skill-docs --host codex   # Codex → .agents/skills/gstack-{name}/S
 bun run gen:skill-docs --host pi      # Pi → .pi/skills/gstack-{name}/SKILL.md
 ```
 
-All three hosts share the same template pipeline — the differences are in frontmatter, paths, metadata, and content stripping.
+**Shared transforms (Pi + Codex vs Claude):** Frontmatter stripped to `name:` + `description:` only (Claude's `allowed-tools`/`hooks`/`version` removed; hook-based skills get inline safety prose instead). Preamble uses `$GSTACK_ROOT`/`$GSTACK_BIN`/`$GSTACK_BROWSE` with repo-local-first resolution. `/codex` skill excluded (self-referential). All `~/.claude/` and `.claude/` paths rewritten to host equivalents. Skill naming via `codexSkillName()`: root → `gstack`, subdirs → `gstack-{dir}`, existing `gstack-` prefix preserved.
 
-#### What's shared between Pi and Codex (vs Claude)
-
-- **Frontmatter** stripped to `name:` + `description:` only. Claude has `allowed-tools`, `hooks`, `version` — these don't exist in Codex/Pi. Hook-based skills (careful, freeze, guard) get inline safety prose injected into the body instead.
-- **Preamble** uses `$GSTACK_ROOT` / `$GSTACK_BIN` / `$GSTACK_BROWSE` shell variables with runtime resolution: check for a repo-local override first, fall back to the global install.
-- **`/codex` skill** excluded from output. It wraps `codex exec` — self-referential for Codex, irrelevant for Pi.
-- **Path rewriting** rewrites all `~/.claude/` and `.claude/` paths to host-appropriate equivalents.
-- **Skill naming** via `codexSkillName()`: root template → `gstack`, subdirectories → `gstack-{dir}`, directories already prefixed with `gstack-` pass through unchanged (no double-prefix).
-
-#### Differences between Pi and Codex
+#### Pi vs Codex differences
 
 | Aspect | Pi | Codex |
 |--------|-----|-------|
-| **Output directory** | `.pi/skills/gstack-{name}/` | `.agents/skills/gstack-{name}/` |
-| **Global install** | `~/.pi/agent/skills/gstack` | `~/.codex/skills/gstack` |
-| **Local override** | `.pi/skills/gstack` | `.agents/skills/gstack` |
-| **name: field** | Must match directory name — `gstack-review`, not `review` | Passes through unchanged |
-| **openai.yaml** | Not generated | Generated in `agents/openai.yaml` per skill |
-| **Codex CLI sections** | Kept (Pi users may have `codex` CLI) | Stripped (Codex can't invoke itself) |
-| **Setup install** | `cp` (copies SKILL.md) | `ln -snf` (symlinks skill dirs) |
-| **Migration logic** | None (new host) | `migrate_direct_codex_install()` |
-| **Runtime root creation** | Inline in setup | Dedicated `create_codex_runtime_root()` |
+| **Output / global / local dirs** | `.pi/skills/`, `~/.pi/agent/skills/`, `.pi/skills/` | `.agents/skills/`, `~/.codex/skills/`, `.agents/skills/` |
+| **name: field** | Must match dir name (`gstack-review`) — Pi validates at runtime | Passes through unchanged |
+| **openai.yaml** | Not generated | Generated per skill |
+| **Codex CLI sections** | Kept (Pi users may have `codex`) | Stripped (self-referential) |
+| **Setup install** | `cp` (avoids dangling symlinks) | `ln -snf` (supports dual-path discovery) |
+| **Migration** | None (new host) | `migrate_direct_codex_install()` |
 | **Repo-local detection** | Not yet implemented | `CODEX_REPO_LOCAL` flag |
-
-**Why Pi transforms name:** Pi validates at runtime that the `name:` field in SKILL.md frontmatter matches the parent directory name. Since output directories are `gstack-{name}`, the name field must also be `gstack-{name}`. Codex doesn't enforce this, so Codex names pass through from the template unchanged.
-
-**Why Pi copies instead of symlinks:** Pi's skill discovery scans `~/.pi/agent/skills/` directly. Copies are simpler and avoid dangling symlinks if the source repo moves. Codex uses symlinks because its skill discovery supports both global and repo-local paths with fallback resolution.
 
 #### Path rewrite rules
 
-Order matters — specific rules before general (otherwise `.claude/skills/gstack` would match the catch-all `.claude/skills` rule first):
+Order matters — specific before general to avoid prefix collisions:
 
 ```
-# Pi rewrites:
-~/.claude/skills/gstack  →  $GSTACK_ROOT
-.claude/skills/gstack    →  .pi/skills/gstack
-.claude/skills/review    →  .pi/skills/gstack/review    ← sidecar!
-.claude/skills           →  .pi/skills
-
-# Codex rewrites:
-~/.claude/skills/gstack  →  $GSTACK_ROOT
-.claude/skills/gstack    →  .agents/skills/gstack
-.claude/skills/review    →  .agents/skills/gstack/review
-.claude/skills           →  .agents/skills
+~/.claude/skills/gstack  →  $GSTACK_ROOT              # both hosts
+.claude/skills/gstack    →  .{pi,agents}/skills/gstack
+.claude/skills/review    →  .{pi,agents}/skills/gstack/review   ← sidecar!
+.claude/skills           →  .{pi,agents}/skills
 ```
 
-The `review → gstack/review` rewrite is critical: review sidecar files (checklist.md, design-checklist.md, TODOS-format.md, greptile-triage.md) live under the main `gstack/` runtime root, not under `gstack-review/`. Without this specific rule, skills would reference non-existent paths like `.pi/skills/gstack-review/checklist.md`.
+The `review → gstack/review` rewrite is critical: review sidecars (checklist.md, design-checklist.md, etc.) live under the `gstack/` runtime root, not under `gstack-review/`.
 
-#### Setup install flow
+#### Pi setup flow (`setup` sections 1c + 7)
 
-The `setup` script (sections 1c and 7) handles Pi installation:
+1. **Generate** (`INSTALL_PI=1`): Runs `gen:skill-docs --host pi` explicitly (not included in `bun run build`).
+2. **Runtime root**: Creates `~/.pi/agent/skills/gstack/` with symlinked assets (`bin/`, `browse/dist`, `browse/bin`, `ETHOS.md`, review sidecars).
+3. **Install**: Copies each `SKILL.md` from generated `.pi/skills/gstack-*/` into `~/.pi/agent/skills/gstack-*/`.
+4. **Cleanup**: Removes stale whole-directory symlinks from previous layouts.
 
-1. **Generation** (step 1c): Runs `bun run gen:skill-docs --host pi` when `INSTALL_PI=1`. Unlike Codex, this always runs because `bun run build` doesn't include `--host pi`.
-2. **Runtime root** (step 7): Creates `~/.pi/agent/skills/gstack/` with symlinked runtime assets: `bin/`, `browse/dist`, `browse/bin`, `ETHOS.md`, and individual review sidecar files.
-3. **Skill install**: Copies each `SKILL.md` from the generated `.pi/skills/gstack-*/` directories into `~/.pi/agent/skills/gstack-*/`.
-4. **Cleanup**: Removes old whole-directory symlinks from previous install layouts (`[ -L "$PI_GSTACK" ] && rm -f`).
-
-What Pi's setup intentionally omits vs Codex:
-- No `create_pi_runtime_root()` function — inline is sufficient for now.
-- No `create_agents_sidecar` — Pi doesn't have Codex's dual-path discovery problem.
-- No `migrate_direct_codex_install` — Pi is new, no legacy installs to migrate.
-- No repo-local install detection (`CODEX_REPO_LOCAL`) — Pi always installs globally. This is a potential area for future work if Pi projects need repo-local skill overrides.
+Intentionally omitted vs Codex: no dedicated `create_pi_runtime_root()` (inline suffices), no `create_agents_sidecar`, no migration logic, no repo-local detection (future work).
 
 ## Command dispatch
 
