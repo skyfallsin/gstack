@@ -39,6 +39,10 @@ interface HostPaths {
   browseDir: string;
 }
 
+// Pi vs Codex host differences: see ARCHITECTURE.md § "Multi-host generation"
+// for the full reference (shared behavior, unique behavior, path rewrite rules,
+// setup install flow, and what Pi intentionally omits vs Codex).
+
 const HOST_PATHS: Record<Host, HostPaths> = {
   claude: {
     skillRoot: '~/.claude/skills/gstack',
@@ -53,6 +57,8 @@ const HOST_PATHS: Record<Host, HostPaths> = {
     browseDir: '$GSTACK_BROWSE',
   },
   pi: {
+    // Pi shares Codex's dynamic $GSTACK_ROOT pattern but resolves to
+    // ~/.pi/agent/skills/gstack at runtime (see generatePreambleBash).
     skillRoot: '$GSTACK_ROOT',
     localSkillRoot: '.pi/skills/gstack',
     binDir: '$GSTACK_BIN',
@@ -184,6 +190,11 @@ function generateSnapshotFlags(_ctx: TemplateContext): string {
 }
 
 function generatePreambleBash(ctx: TemplateContext): string {
+  // Pi and Codex both use dynamic $GSTACK_ROOT resolution with a repo-local
+  // override. The pattern is identical — only the paths differ:
+  //   Codex: default $HOME/.codex/skills/gstack, override .agents/skills/gstack
+  //   Pi:    default $HOME/.pi/agent/skills/gstack, override .pi/skills/gstack
+  // Claude uses hardcoded ~/.claude/skills/gstack paths (no $GSTACK_ROOT).
   const runtimeRoot = ctx.host === 'codex'
     ? `_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
 GSTACK_ROOT="$HOME/.codex/skills/gstack"
@@ -2910,9 +2921,14 @@ policy:
 }
 
 /**
- * Transform frontmatter for Codex: keep only name + description.
+ * Transform frontmatter for Codex/Pi: keep only name + description.
  * Strips allowed-tools, hooks, version, and all other fields.
  * Handles multiline block scalar descriptions (YAML | syntax).
+ *
+ * Pi-specific: the name: field is prefixed with 'gstack-' (e.g., 'review'
+ * becomes 'gstack-review') because Pi validates that name: matches the
+ * parent directory name at runtime. Codex doesn't enforce this, so Codex
+ * names pass through unchanged.
  */
 function transformFrontmatter(content: string, host: Host): string {
   if (host === 'claude') return content;
@@ -3052,7 +3068,10 @@ function processTemplate(tmplPath: string, host: Host = 'claude'): { outputPath:
       content = content.replace(/\.claude\/skills/g, '.pi/skills');
     }
 
-    // Write openai.yaml agent metadata (codex only — pi doesn't need it)
+    // Write openai.yaml agent metadata (codex only).
+    // Pi doesn't generate openai.yaml — Pi's skill discovery reads the
+    // name: and description: fields directly from SKILL.md frontmatter.
+    // Codex needs the separate openai.yaml for its skill browsing UI.
     if (host === 'codex' && outputDir) {
       const codexName = codexSkillName(skillDir === '.' ? '' : skillDir);
       const agentsDir = path.join(outputDir, 'agents');
